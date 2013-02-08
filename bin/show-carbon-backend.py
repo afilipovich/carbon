@@ -24,6 +24,7 @@ LIB_DIR = join(ROOT_DIR, 'lib')
 sys.path.insert(0, LIB_DIR)
 
 from carbon.routers import ConsistentHashingRouter
+from carbon import util
 
 def setupOptionParser():
     parser = OptionParser(usage=usage, epilog=epilog)
@@ -39,6 +40,10 @@ def setupOptionParser():
                 default=False,
                 action = 'store_true',
                 help='Show backend port number and name')
+    parser.add_option('--ignore-keyfunc',
+                default=False,
+                action = 'store_true',
+                help='Do not load keyfunc even if it is present in the carbon config file')
     return parser
 
 def parse_config(config_path):
@@ -52,29 +57,18 @@ def parse_config(config_path):
         k = k.strip()
         v = v.strip()
         options[k] = v
+    if options.has_key('DESTINATIONS'):
+        destinations_strings = [v.strip() for v in options['DESTINATIONS'].split(',')]
+        options['DESTINATIONS'] = util.parseDestinations(destinations_strings)
     return options
 
 def configure_router(config):
     if config['RELAY_METHOD'] == 'consistent-hashing':
-        router = ConsistentHashingRouter(config['REPLICATION_FACTOR'])
+        router = ConsistentHashingRouter(int(config['REPLICATION_FACTOR']))
     else:
         print "Unsupported relay method '%s'" % config['RELAY_METHOD']
         sys.exit(1)
     return router
-
-def load_carbon_hosts(destinations):
-    hosts = []
-    for host in destinations.split(','):
-        host = host.strip()
-        parts = host.split(':')
-        server = parts[0]
-        port = int( parts[1] )
-        if len(parts) > 2:
-            instance = parts[2]
-        else:
-            instance = None
-        hosts.append( (server, int(port), instance) )
-    return hosts
 
 def list_packrat_logs(packrat_logs_path):
     for l in listdir(packrat_logs_path):
@@ -133,9 +127,9 @@ Please provide either --is-packrat-log or --is-metric-path option"""
         sys.exit(1)
     config = parse_config(carbon_config_path)
     router = configure_router(config)
-    if config.has_key('KEYFUNC'):
+    if not options.ignore_keyfunc and config.has_key('KEYFUNC'):
         router.setKeyFunctionFromModule(config['KEYFUNC'])
-    for d in load_carbon_hosts(config['DESTINATIONS']):
+    for d in config['DESTINATIONS']:
         router.addDestination(d)
     if is_packrat_log:
         for m in get_metrics(metric_path):
