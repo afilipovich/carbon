@@ -1,0 +1,233 @@
+#!/usr/bin/python
+
+"Scans through metrics stored at Carbon Storage node, finds those not belonging to the server and moves them to the appropriate node"
+
+usage = "%prog [OPTIONS]"
+
+epilog = """"""
+
+import sys
+import imp
+from os import path, walk, stat, remove
+from optparse import OptionParser
+import socket
+import time
+import paramiko
+import re
+
+import logging
+log = logging.getLogger('tool')
+log.setLevel(logging.DEBUG)
+
+# Figure out where we're installed
+BIN_DIR = path.dirname(path.abspath(__file__))
+ROOT_DIR = path.dirname(BIN_DIR)
+CONF_DIR = path.join(ROOT_DIR, 'conf')
+default_relayrules = path.join(CONF_DIR, 'relay.conf')
+
+# Make sure that carbon's 'lib' dir is in the $PYTHONPATH if we're running from
+# source.
+LIB_DIR = path.join(ROOT_DIR, 'lib')
+sys.path.insert(0, LIB_DIR)
+
+from carbon.routers import ConsistentHashingRouter
+from carbon import util
+
+def setupOptionParser():
+    parser = OptionParser(usage=usage, epilog=epilog)
+    parser.add_option('--debug',
+                default=False,
+                action = 'store_true',
+                help='Verbose output')
+    parser.add_option('--do-cleanup',
+                default=False,
+                action = 'store_true',
+                help='Remove local .wsp file after it is transferred to the remote host.')
+    parser.add_option('--log',
+                default=None,
+                help='Path to log file, by default log to STDERR')
+    parser.add_option('--relay-conf',
+                default='/opt/graphite/conf/carbon-daemons/agger2/relay.conf',
+                help='Path to relay.conf')
+    parser.add_option('--whisper-storage',
+                default='/opt/graphite/storage/whisper',
+                help='Path to whisper storage')
+    parser.add_option('--ssh-key',
+                default='/root/.ssh/id_dsa',
+                help='Path to the private SSH key')
+    parser.add_option('--whisper-merge-path',
+                default='/usr/bin/whisper-merge.py',
+                help='Path to whisper-merge.py')
+    parser.add_option('--match-metrics',
+                default=None,
+                help='If provided only metrics matching the regex pattern will be moved')
+    parser.add_option('--ssh-user',
+                default='root',
+                help='SSH user')
+    parser.add_option('--activity-threshold',
+                type='int',
+                default=60,
+                help='Consider .wsp files whith mtime less than X as active, i.e. being written to (possibly because of routing misconfiguration or Carbon cache flushing). In minutes')
+    parser.add_option('--nochange',
+                default=False,
+                action = 'store_true',
+                help='Do not make any real changes')
+    parser.add_option('--ignore-keyfunc',
+                default=False,
+                action = 'store_true',
+                help='Do not load keyfunc even if it is present in the carbon config file')
+    return parser
+
+def setupLogger(log_file, debug):
+    formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+    lh = log_file is None and logging.StreamHandler() or logging.FileHandler(log_file)
+    lh.setLevel(debug and logging.DEBUG or logging.INFO)
+    lh.setFormatter(formatter)
+    log = logging.getLogger('tool')
+    log.addHandler(lh)
+
+def parse_config(config_path):
+    options = {}
+    f = open(config_path)
+    for l in f.readlines():
+        l = l.strip()
+        if len(l) == 0 or l.startswith('#'):
+            continue
+        k, v = l.split('=')
+        k = k.strip()
+        v = v.strip()
+        options[k] = v
+    if options.has_key('DESTINATIONS'):
+        destinations_strings = [v.strip() for v in options['DESTINATIONS'].split(',')]
+        options['DESTINATIONS'] = util.parseDestinations(destinations_strings)
+    return options
+
+def configure_router(config):
+    if config['RELAY_METHOD'] == 'consistent-hashing':
+        router = ConsistentHashingRouter(int(config['REPLICATION_FACTOR']))
+    else:
+        print "Unsupported relay method '%s'" % config['RELAY_METHOD']
+        sys.exit(1)
+    return router
+
+def find_wsp_files(whisper_storage_path):
+    if whisper_storage_path[-1] != '/':
+        whisper_storage_path += '/'
+    for root, dirs, files in walk(whisper_storage_path):
+        for f in files:
+            if path.splitext(f)[-1] == '.wsp':
+                wsp_path = path.join(root, f)
+                metric_path = '.'.join(wsp_path.replace(whisper_storage_path, '').split('.')[:-1]).replace('/', '.')
+                yield(metric_path, wsp_path)
+
+def autodetect_path_arg(metric_path):
+    if len(metric_path.split('/')) > 3:
+        return True
+    if len(metric_path.split('.')) > 3:
+        return False
+    return None
+
+known_ids = {}
+def is_localhost(id):
+    if id in known_ids:
+        return known_ids[id]
+    ip = socket.gethostbyname(id)
+    if ip in known_ids:
+        known_ids[ip] = known_ids[id]
+        return known_ids[id]
+    try:
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).bind((ip, 49997))
+        known_ids[ip] = True
+        return True
+    except:
+        known_ids[ip] = False
+        return False
+
+class MetricsMover(object):
+    def __init__(self, ssh_user, ssh_key, whisper_merge_path='/usr/bin/whisper-merge.py'):
+        self.ssh_user = ssh_user
+        self.ssh_key = ssh_key
+        self.whisper_merge_path = whisper_merge_path
+        self._connections_cache = {}
+        fd = open(self.ssh_key)
+        self.pkey = paramiko.DSSKey.from_private_key(fd)
+        fd.close()
+
+    def connect(self, host):
+        client = paramiko.SSHClient()
+        missing_key_policy = paramiko.AutoAddPolicy()
+        client.set_missing_host_key_policy(missing_key_policy)
+        client.connect(host, username=self.ssh_user, pkey=self.pkey, timeout=10)
+        transport = client.get_transport()
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        self._connections_cache[host] = (client, sftp)
+
+    def sshClient(self, host):
+        if not self._connections_cache.has_key(host):
+            self.connect(host)
+        return self._connections_cache[host][0]
+
+    def sftpClient(self, host):
+        if not self._connections_cache.has_key(host):
+            self.connect(host)
+        return self._connections_cache[host][1]
+
+    def moveNmerge(self, host, metric, wsp_file):
+        temp_file = path.join('/tmp', path.split(wsp_file)[1])
+        self.sftpClient(host).put(localpath=wsp_file, remotepath=temp_file)
+        cmd = 'if [ -f %(wsp_file)s ]; then (%(whisper_merge_path)s --cc %(temp_file)s %(wsp_file)s); else cp %(temp_file)s %(wsp_file)s; fi; rm %(temp_file)s' % {'temp_file': temp_file, 'wsp_file': wsp_file, 'whisper_merge_path': self.whisper_merge_path}
+#        cmd = 'ls %(temp_file)s; rm %(temp_file)s' % {'temp_file': temp_file, 'wsp_file': wsp_file}
+        stdin, stdout, stderr = self.sshClient(host).exec_command(cmd)
+        exit_status = stdout.channel.recv_exit_status()
+        stderr_lines = stderr.read()
+        stdout_lines = stdout.read()
+        if exit_status == 0:
+            if stderr_lines: log.debug( 'STDERR: %s', stderr_lines )
+            if stdout_lines: log.debug( 'STDOUT: %s', stdout_lines )
+        else:
+            log.warn('Non-zero exit status for command "%s"', cmd)
+            if stderr_lines: log.warn( 'STDERR: %s', stderr_lines )
+            if stdout_lines: log.warn( 'STDOUT: %s', stdout_lines )
+        return exit_status == 0
+
+def main():
+    opts_parser = setupOptionParser()
+    (options, args) = opts_parser.parse_args()
+    setupLogger(options.log, options.debug)
+    carbon_config_path = options.relay_conf
+    whisper_storage_path = options.whisper_storage
+    config = parse_config(carbon_config_path)
+    router = configure_router(config)
+    metricsMover = MetricsMover(options.ssh_user, options.ssh_key, whisper_merge_path=options.whisper_merge_path)
+    now = time.time() + time.timezone
+    activity_threshold = now - options.activity_threshold * 60
+    if not options.ignore_keyfunc and config.has_key('KEYFUNC') and config['KEYFUNC']:
+        router.setKeyFunctionFromModule(config['KEYFUNC'])
+    for d in config['DESTINATIONS']:
+        router.addDestination(d)
+    metric_re = None
+    if options.match_metrics is not None:
+        metric_re = re.compile(options.match_metrics)
+    for metric, wsp_path in find_wsp_files(whisper_storage_path):
+        if metric_re is not None:
+            if not metric_re.search(metric):
+                continue
+        is_local = False
+        r_hosts = []
+        for r_host, r_port, r_name in router.getDestinations(metric):
+            # metric is local if is local server is one of its nodes
+            is_local = is_local or metric.startswith('carbon.') or is_localhost(r_host)
+            r_hosts.append(r_host)
+        mtime = stat(wsp_path)[8]
+        is_active = mtime > activity_threshold
+        if not (is_local or is_active):
+            for r_host in r_hosts:
+                log.info( '%s is neither local nor active and should be moved to %s', wsp_path, r_host)
+                if not options.nochange:
+                    if metricsMover.moveNmerge(r_host, metric, wsp_path) and options.do_cleanup:
+                        log.info('Removing %s', wsp_path)
+                        remove(wsp_path)
+
+if __name__ == '__main__':
+    main()
+
